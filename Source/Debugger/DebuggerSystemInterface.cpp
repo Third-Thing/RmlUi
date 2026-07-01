@@ -47,6 +47,11 @@ void DebuggerSystemInterface::SetClipboardText(const String& text)
 	application_interface->SetClipboardText(text);
 }
 
+void DebuggerSystemInterface::RequestClipboardText(Function<void(String)> callback)
+{
+	application_interface->RequestClipboardText(std::move(callback));
+}
+
 void DebuggerSystemInterface::GetClipboardText(String& text)
 {
 	application_interface->GetClipboardText(text);

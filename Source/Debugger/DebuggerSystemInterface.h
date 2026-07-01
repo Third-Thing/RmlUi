@@ -49,6 +49,10 @@ public:
 	/// @param[in] text Text to apply to clipboard.
 	void SetClipboardText(const String& text) override;
 
+	/// Request clipboard text.
+	/// @param[in] callback Called with the retrieved clipboard text.
+	void RequestClipboardText(Function<void(String)> callback) override;
+
 	/// Get clipboard text.
 	/// @param[out] text Retrieved text from clipboard.
 	void GetClipboardText(String& text) override;
