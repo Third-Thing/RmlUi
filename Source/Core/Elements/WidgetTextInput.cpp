@@ -216,6 +216,7 @@ WidgetTextInput::WidgetTextInput(ElementFormControl* _parent)
 
 	last_update_time = 0;
 	ink_overflow = false;
+	paste_request_id = 0;
 
 	ShowCursor(false);
 }
@@ -617,13 +618,7 @@ void WidgetTextInput::ProcessEvent(Event& event)
 		{
 			if (ctrl && !alt)
 			{
-				String clipboard_text;
-				GetSystemInterface()->GetClipboardText(clipboard_text);
-
-				if (AddCharacters(clipboard_text))
-					OnLayout();
-				MoveToCursor();
-				ShowCursor(true);
+				PasteFromClipboard();
 			}
 		}
 		break;
@@ -787,6 +782,26 @@ void WidgetTextInput::CopySelection()
 	const String& value = GetValue();
 	const String snippet = value.substr(Math::Min((size_t)selection_begin_index, (size_t)value.size()), (size_t)selection_length);
 	GetSystemInterface()->SetClipboardText(snippet);
+}
+
+void WidgetTextInput::PasteFromClipboard()
+{
+	const int request_id = ++paste_request_id;
+	ObserverPtr<EventListener> self = GetObserverPtr();
+
+	GetSystemInterface()->RequestClipboardText([self, request_id](String clipboard_text) {
+		if (!self)
+			return;
+
+		auto* widget = static_cast<WidgetTextInput*>(self.get());
+		if (widget->paste_request_id != request_id)
+			return;
+
+		if (widget->AddCharacters(std::move(clipboard_text)))
+			widget->OnLayout();
+		widget->MoveToCursor();
+		widget->ShowCursor(true);
+	});
 }
 
 bool WidgetTextInput::MoveCursorHorizontal(CursorMovement movement, bool select, bool& out_of_bounds)

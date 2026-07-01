@@ -49,6 +49,10 @@ public:
 	/// @param[in] text Text to apply to clipboard.
 	virtual void SetClipboardText(const String& text);
 
+	/// Request clipboard text.
+	/// @param[in] callback Called with the retrieved clipboard text.
+	virtual void RequestClipboardText(Function<void(String)> callback);
+
 	/// Get clipboard text.
 	/// @param[out] text Retrieved text from clipboard.
 	virtual void GetClipboardText(String& text);

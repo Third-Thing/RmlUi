@@ -38,6 +38,14 @@ void SystemInterface::SetClipboardText(const String& text)
 	GlobalClipBoardText() = text;
 }
 
+void SystemInterface::RequestClipboardText(Function<void(String)> callback)
+{
+	String text;
+	GetClipboardText(text);
+	if (callback)
+		callback(std::move(text));
+}
+
 void SystemInterface::GetClipboardText(String& text)
 {
 	text = GlobalClipBoardText();

@@ -211,6 +211,8 @@ private:
 	void DeleteSelection();
 	/// Copies the selection (if any) to the clipboard.
 	void CopySelection();
+	/// Requests clipboard text and inserts it when available.
+	void PasteFromClipboard();
 
 	/// Split one line of text into three parts, based on the current selection.
 	/// @param[out] pre_selection The section of unselected text before any selected text on the line.
@@ -282,6 +284,7 @@ private:
 	float cursor_timer;
 	bool cursor_visible;
 	bool keyboard_showed;
+	int paste_request_id;
 	/// Activate or deactivate keyboard (for touchscreen devices)
 	/// @param[in] active True if need activate keyboard, false if need deactivate.
 	void SetKeyboardActive(bool active);
