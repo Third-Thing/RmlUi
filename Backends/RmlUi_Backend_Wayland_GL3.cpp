@@ -19,6 +19,7 @@
 
 static constexpr int MinimumWindowWidth = 1;
 static constexpr int MinimumWindowHeight = 1;
+static constexpr double ClipboardPollTimeout = 0.5;
 using Clock = std::chrono::steady_clock;
 
 struct KeyboardRepeatState {
@@ -557,17 +558,18 @@ static bool DispatchWaylandEvents(double timeout_seconds)
 	int poll_fd_count = 1;
 	if (const int clipboard_read_fd = data->system_interface->GetClipboardReadFd(); clipboard_read_fd >= 0)
 	{
-		poll_fds[1].fd = clipboard_read_fd;
-		poll_fds[1].events = POLLIN;
-		poll_fd_count = 2;
-			timeout_seconds = Rml::Math::Min(timeout_seconds, 0.5);
-	}
-	if (const int clipboard_write_fd = data->system_interface->GetClipboardWriteFd(); clipboard_write_fd >= 0)
-	{
-		poll_fds[poll_fd_count].fd = clipboard_write_fd;
-		poll_fds[poll_fd_count].events = POLLOUT;
-		poll_fd_count += 1;
-	}
+			poll_fds[1].fd = clipboard_read_fd;
+			poll_fds[1].events = POLLIN;
+			poll_fd_count = 2;
+			timeout_seconds = Rml::Math::Min(timeout_seconds, ClipboardPollTimeout);
+		}
+		if (const int clipboard_write_fd = data->system_interface->GetClipboardWriteFd(); clipboard_write_fd >= 0)
+		{
+			poll_fds[poll_fd_count].fd = clipboard_write_fd;
+			poll_fds[poll_fd_count].events = POLLOUT;
+			poll_fd_count += 1;
+			timeout_seconds = Rml::Math::Min(timeout_seconds, ClipboardPollTimeout);
+		}
 
 	const int timeout_ms = int(std::ceil(timeout_seconds * 1000.0));
 	const int poll_result = poll(poll_fds, poll_fd_count, timeout_ms);
@@ -593,13 +595,19 @@ static bool DispatchWaylandEvents(double timeout_seconds)
 				data->system_interface->ProcessClipboardWrite();
 		}
 	}
-	else if (data->system_interface->GetClipboardReadFd() >= 0)
-	{
-		data->system_interface->ProcessClipboardRead();
-	}
+		else if (data->system_interface->GetClipboardReadFd() >= 0 || data->system_interface->GetClipboardWriteFd() >= 0)
+		{
+			if (data->system_interface->GetClipboardReadFd() >= 0)
+				data->system_interface->ProcessClipboardRead();
+			if (data->system_interface->GetClipboardWriteFd() >= 0)
+				data->system_interface->ProcessClipboardWrite();
+		}
 
-	return wl_display_get_error(display) == 0;
-}
+		if (data->system_interface->GetClipboardWriteFd() >= 0)
+			data->system_interface->ProcessClipboardWrite();
+
+		return wl_display_get_error(display) == 0;
+	}
 
 bool Backend::Initialize(const char* window_name, int width, int height, bool allow_resize)
 {

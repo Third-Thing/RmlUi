@@ -14,6 +14,7 @@ static constexpr const char* MimeTextPlain = "text/plain";
 static constexpr size_t MaxClipboardTextBytes = 16 * 1024 * 1024;
 static constexpr double ClipboardReadIdleTimeout = 0.5;
 static constexpr double ClipboardReadTimeout = 5.0;
+static constexpr double ClipboardWriteTimeout = 5.0;
 
 static double GetMonotonicTime()
 {
@@ -466,6 +467,13 @@ public:
 		while (!pending_writes.empty())
 		{
 			PendingWrite& write = pending_writes.front();
+			if (GetMonotonicTime() - write.start_time >= ClipboardWriteTimeout)
+			{
+				CloseFd(write.fd);
+				pending_writes.erase(pending_writes.begin());
+				continue;
+			}
+
 			while (write.offset < write.text.size())
 			{
 				const ssize_t bytes_written = WriteNoSigpipe(write.fd, write.text.data() + write.offset, write.text.size() - write.offset);
@@ -497,6 +505,7 @@ private:
 		int fd = -1;
 		Rml::String text;
 		size_t offset = 0;
+		double start_time = 0.0;
 	};
 
 	void DestroyDataDevice()
@@ -643,11 +652,11 @@ private:
 		auto* manager = static_cast<ClipboardManager_Wayland*>(data);
 		if (IsTextMimeType(mime_type))
 		{
-			SetCloseOnExec(fd);
-			SetNonBlocking(fd);
-			manager->pending_writes.push_back(PendingWrite{fd, manager->owned_text, 0});
-			manager->ProcessWrite();
-		}
+				SetCloseOnExec(fd);
+				SetNonBlocking(fd);
+				manager->pending_writes.push_back(PendingWrite{fd, manager->owned_text, 0, GetMonotonicTime()});
+				manager->ProcessWrite();
+			}
 		else
 		{
 			close(fd);
