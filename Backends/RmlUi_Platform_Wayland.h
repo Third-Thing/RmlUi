@@ -10,20 +10,26 @@
 
 struct xdg_wm_base;
 struct zxdg_decoration_manager_v1;
+class ClipboardManager_Wayland;
 
 class SystemInterface_Wayland : public Rml::SystemInterface {
 public:
-	SystemInterface_Wayland(wl_display* display, wl_shm* shm);
+	SystemInterface_Wayland(wl_display* display, wl_shm* shm, wl_data_device_manager* data_device_manager);
 	~SystemInterface_Wayland();
 
 	void SetPointer(wl_pointer* pointer);
+	void SetSeat(wl_seat* seat);
 	void SetCursorSurface(wl_surface* surface);
 	void SetPointerSerial(uint32_t serial);
 	void ClearPointerSerial();
+	void SetSeatSerial(uint32_t serial);
+	int GetClipboardReadFd() const;
+	void ProcessClipboardRead();
 
 	double GetElapsedTime() override;
 	void SetMouseCursor(const Rml::String& cursor_name) override;
 	void SetClipboardText(const Rml::String& text) override;
+	void RequestClipboardText(Rml::Function<void(Rml::String)> callback) override;
 	void GetClipboardText(Rml::String& text) override;
 
 private:
@@ -38,7 +44,7 @@ private:
 	timeval start_time {};
 	uint32_t pointer_serial = 0;
 	bool has_pointer_serial = false;
-	Rml::String clipboard_text;
+	Rml::UniquePtr<ClipboardManager_Wayland> clipboard_manager;
 };
 
 namespace RmlWayland {
@@ -47,6 +53,7 @@ struct Globals {
 	wl_compositor* compositor = nullptr;
 	wl_shm* shm = nullptr;
 	wl_seat* seat = nullptr;
+	wl_data_device_manager* data_device_manager = nullptr;
 	xdg_wm_base* wm_base = nullptr;
 	zxdg_decoration_manager_v1* decoration_manager = nullptr;
 };

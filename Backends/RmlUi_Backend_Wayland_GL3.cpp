@@ -97,6 +97,9 @@ static void RegistryHandleGlobal(void* user_data, wl_registry* registry, uint32_
 		globals->shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
 	else if (std::strcmp(interface, wl_seat_interface.name) == 0)
 		globals->seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, std::min(version, 7u)));
+	else if (std::strcmp(interface, wl_data_device_manager_interface.name) == 0)
+		globals->data_device_manager = static_cast<wl_data_device_manager*>(
+			wl_registry_bind(registry, name, &wl_data_device_manager_interface, std::min(version, 3u)));
 	else if (std::strcmp(interface, xdg_wm_base_interface.name) == 0)
 		globals->wm_base = static_cast<xdg_wm_base*>(wl_registry_bind(registry, name, &xdg_wm_base_interface, std::min(version, 7u)));
 	else if (std::strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0)
@@ -178,7 +181,7 @@ static void PointerHandleMotion(void*, wl_pointer*, uint32_t, wl_fixed_t sx, wl_
 		data->context->ProcessMouseMove(wl_fixed_to_int(sx), wl_fixed_to_int(sy), data->keyboard_state.modifiers);
 }
 
-static void PointerHandleButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t button, uint32_t state)
+static void PointerHandleButton(void*, wl_pointer*, uint32_t serial, uint32_t, uint32_t button, uint32_t state)
 {
 	if (!data->context)
 		return;
@@ -186,6 +189,8 @@ static void PointerHandleButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t
 	const int mouse_button = RmlWayland::ConvertMouseButton(button);
 	if (mouse_button < 0)
 		return;
+
+	data->system_interface->SetSeatSerial(serial);
 
 	if (state == WL_POINTER_BUTTON_STATE_PRESSED)
 		data->context->ProcessMouseButtonDown(mouse_button, data->keyboard_state.modifiers);
@@ -238,7 +243,10 @@ static void KeyboardHandleKeymap(void*, wl_keyboard*, uint32_t format, int32_t f
 	munmap(mapped, size);
 }
 
-static void KeyboardHandleEnter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {}
+static void KeyboardHandleEnter(void*, wl_keyboard*, uint32_t serial, wl_surface*, wl_array*)
+{
+	data->system_interface->SetSeatSerial(serial);
+}
 
 static void KeyboardHandleLeave(void*, wl_keyboard*, uint32_t, wl_surface*)
 {
@@ -328,10 +336,12 @@ static double GetKeyRepeatTimeout(double timeout_seconds)
 	return Rml::Math::Min(timeout_seconds, repeat_timeout);
 }
 
-static void KeyboardHandleKey(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t state)
+static void KeyboardHandleKey(void*, wl_keyboard*, uint32_t serial, uint32_t, uint32_t key, uint32_t state)
 {
 	if (!data->context || !data->keyboard_state.state)
 		return;
+
+	data->system_interface->SetSeatSerial(serial);
 
 	const xkb_keycode_t keycode = key + 8;
 	const bool pressed = (state == WL_KEYBOARD_KEY_STATE_PRESSED);
@@ -434,12 +444,15 @@ static bool InitializeWayland(const char* window_name, int width, int height, bo
 		return false;
 	}
 
-	data->system_interface = Rml::MakeUnique<SystemInterface_Wayland>(display, data->globals.shm);
+	data->system_interface = Rml::MakeUnique<SystemInterface_Wayland>(display, data->globals.shm, data->globals.data_device_manager);
 
 	xdg_wm_base_add_listener(data->globals.wm_base, &xdg_wm_base_listener, nullptr);
 
 	if (data->globals.seat)
+	{
 		wl_seat_add_listener(data->globals.seat, &seat_listener, nullptr);
+		data->system_interface->SetSeat(data->globals.seat);
+	}
 
 	data->surface = wl_compositor_create_surface(data->globals.compositor);
 	data->cursor_surface = wl_compositor_create_surface(data->globals.compositor);
@@ -540,9 +553,18 @@ static bool DispatchWaylandEvents(double timeout_seconds)
 	display_fd.fd = wl_display_get_fd(display);
 	display_fd.events = POLLIN;
 
+	pollfd poll_fds[2] = {display_fd, {}};
+	int poll_fd_count = 1;
+	if (const int clipboard_read_fd = data->system_interface->GetClipboardReadFd(); clipboard_read_fd >= 0)
+	{
+		poll_fds[1].fd = clipboard_read_fd;
+		poll_fds[1].events = POLLIN;
+		poll_fd_count = 2;
+	}
+
 	const int timeout_ms = int(std::ceil(timeout_seconds * 1000.0));
-	const int poll_result = poll(&display_fd, 1, timeout_ms);
-	if (poll_result > 0 && (display_fd.revents & POLLIN))
+	const int poll_result = poll(poll_fds, poll_fd_count, timeout_ms);
+	if (poll_result > 0 && (poll_fds[0].revents & POLLIN))
 	{
 		if (wl_display_read_events(display) < 0)
 			return false;
@@ -553,6 +575,10 @@ static bool DispatchWaylandEvents(double timeout_seconds)
 	}
 
 	while (wl_display_dispatch_pending(display) > 0) {}
+
+	if (poll_result > 0 && poll_fd_count > 1 && (poll_fds[1].revents & (POLLIN | POLLHUP | POLLERR)))
+		data->system_interface->ProcessClipboardRead();
+
 	return wl_display_get_error(display) == 0;
 }
 
@@ -621,6 +647,8 @@ void Backend::Shutdown()
 		wl_surface_destroy(data->surface);
 	if (data->globals.seat)
 		wl_seat_destroy(data->globals.seat);
+	if (data->globals.data_device_manager)
+		wl_data_device_manager_destroy(data->globals.data_device_manager);
 	if (data->globals.wm_base)
 		xdg_wm_base_destroy(data->globals.wm_base);
 	if (data->globals.decoration_manager)

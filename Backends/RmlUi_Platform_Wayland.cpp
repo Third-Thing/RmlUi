@@ -1,10 +1,411 @@
 #include "RmlUi_Platform_Wayland.h"
 #include <RmlUi/Core/Log.h>
 #include <RmlUi/Core/StringUtilities.h>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <unistd.h>
 
-SystemInterface_Wayland::SystemInterface_Wayland(wl_display* display, wl_shm* shm) : display(display), shm(shm)
+static constexpr const char* MimeTextUtf8 = "text/plain;charset=utf-8";
+static constexpr const char* MimeTextPlain = "text/plain";
+static constexpr size_t MaxClipboardTextBytes = 16 * 1024 * 1024;
+
+static void CloseFd(int& fd)
+{
+	if (fd >= 0)
+	{
+		close(fd);
+		fd = -1;
+	}
+}
+
+static void SetCloseOnExec(int fd)
+{
+	const int flags = fcntl(fd, F_GETFD);
+	if (flags >= 0)
+		fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+static void SetNonBlocking(int fd)
+{
+	const int flags = fcntl(fd, F_GETFL);
+	if (flags >= 0)
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void WriteAll(int fd, const Rml::String& text)
+{
+	const char* data = text.data();
+	size_t remaining = text.size();
+
+	while (remaining > 0)
+	{
+		const ssize_t bytes_written = write(fd, data, remaining);
+		if (bytes_written > 0)
+		{
+			data += bytes_written;
+			remaining -= size_t(bytes_written);
+		}
+		else if (bytes_written < 0 && errno == EINTR)
+		{
+			continue;
+		}
+		else
+		{
+			break;
+		}
+	}
+}
+
+struct ClipboardOffer_Wayland {
+	explicit ClipboardOffer_Wayland(wl_data_offer* offer) : offer(offer) {}
+	~ClipboardOffer_Wayland()
+	{
+		if (offer)
+			wl_data_offer_destroy(offer);
+	}
+
+	wl_data_offer* offer = nullptr;
+	bool has_text_utf8 = false;
+	bool has_text_plain = false;
+
+	const char* GetPreferredMimeType() const
+	{
+		if (has_text_utf8)
+			return MimeTextUtf8;
+		if (has_text_plain)
+			return MimeTextPlain;
+		return nullptr;
+	}
+};
+
+class ClipboardManager_Wayland {
+public:
+	ClipboardManager_Wayland(wl_display* display, wl_data_device_manager* data_device_manager) : display(display), data_device_manager(data_device_manager) {}
+	~ClipboardManager_Wayland()
+	{
+		CancelRead();
+		current_offer.reset();
+		pending_offer.reset();
+		DestroyActiveSource();
+		DestroyDataDevice();
+	}
+
+	void SetSeat(wl_seat* seat)
+	{
+		DestroyDataDevice();
+
+		if (!data_device_manager || !seat)
+			return;
+
+		data_device = wl_data_device_manager_get_data_device(data_device_manager, seat);
+		if (!data_device)
+			return;
+
+		wl_data_device_add_listener(data_device, &data_device_listener, this);
+	}
+
+	void SetSeatSerial(uint32_t serial)
+	{
+		selection_serial = serial;
+		has_selection_serial = true;
+	}
+
+	void SetText(const Rml::String& text)
+	{
+		owned_text = text;
+		owns_selection = true;
+
+		if (!data_device_manager || !data_device || !has_selection_serial)
+			return;
+
+		DestroyActiveSource();
+
+		wl_data_source* source = wl_data_device_manager_create_data_source(data_device_manager);
+		if (!source)
+			return;
+
+		active_source = source;
+		wl_data_source_add_listener(active_source, &data_source_listener, this);
+		wl_data_source_offer(active_source, MimeTextUtf8);
+		wl_data_source_offer(active_source, MimeTextPlain);
+		wl_data_device_set_selection(data_device, active_source, selection_serial);
+		wl_display_flush(display);
+	}
+
+	void RequestText(Rml::Function<void(Rml::String)> callback)
+	{
+		if (owns_selection)
+		{
+			if (callback)
+				callback(owned_text);
+			return;
+		}
+
+		const char* mime_type = current_offer ? current_offer->GetPreferredMimeType() : nullptr;
+		if (!mime_type)
+		{
+			if (callback)
+				callback(Rml::String());
+			return;
+		}
+
+		CancelRead();
+
+		int pipe_fd[2] = {-1, -1};
+		if (pipe(pipe_fd) != 0)
+		{
+			if (callback)
+				callback(Rml::String());
+			return;
+		}
+
+		SetCloseOnExec(pipe_fd[0]);
+		SetCloseOnExec(pipe_fd[1]);
+		SetNonBlocking(pipe_fd[0]);
+
+		read_fd = pipe_fd[0];
+		read_callback = std::move(callback);
+		read_text.clear();
+
+		wl_data_offer_receive(current_offer->offer, mime_type, pipe_fd[1]);
+		CloseFd(pipe_fd[1]);
+		wl_display_flush(display);
+
+		ProcessRead();
+	}
+
+	void GetText(Rml::String& text) const
+	{
+		if (owns_selection)
+			text = owned_text;
+		else
+			text.clear();
+	}
+
+	int GetReadFd() const
+	{
+		return read_fd;
+	}
+
+	void ProcessRead()
+	{
+		if (read_fd < 0)
+			return;
+
+		char buffer[4096];
+		while (true)
+		{
+			const ssize_t bytes_read = read(read_fd, buffer, sizeof(buffer));
+			if (bytes_read > 0)
+			{
+				if (read_text.size() + size_t(bytes_read) > MaxClipboardTextBytes)
+				{
+					FinishRead(Rml::String());
+					return;
+				}
+
+				read_text.append(buffer, size_t(bytes_read));
+			}
+			else if (bytes_read == 0)
+			{
+				FinishRead(std::move(read_text));
+				return;
+			}
+			else if (errno == EINTR)
+			{
+				continue;
+			}
+			else if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+				return;
+			}
+			else
+			{
+				FinishRead(Rml::String());
+				return;
+			}
+		}
+	}
+
+private:
+	void DestroyDataDevice()
+	{
+		CancelRead();
+		current_offer.reset();
+		pending_offer.reset();
+
+		if (data_device)
+		{
+			if (wl_data_device_get_version(data_device) >= WL_DATA_DEVICE_RELEASE_SINCE_VERSION)
+				wl_data_device_release(data_device);
+			else
+				wl_data_device_destroy(data_device);
+			data_device = nullptr;
+		}
+	}
+
+	void DestroyActiveSource()
+	{
+		if (active_source)
+		{
+			wl_data_source_destroy(active_source);
+			active_source = nullptr;
+		}
+	}
+
+	void CancelRead()
+	{
+		CloseFd(read_fd);
+		read_text.clear();
+		read_callback = nullptr;
+	}
+
+	void FinishRead(Rml::String text)
+	{
+		CloseFd(read_fd);
+		read_text.clear();
+
+		Rml::Function<void(Rml::String)> callback = std::move(read_callback);
+		read_callback = nullptr;
+		if (callback)
+			callback(std::move(text));
+	}
+
+	void SetPendingOffer(wl_data_offer* offer)
+	{
+		pending_offer = Rml::MakeUnique<ClipboardOffer_Wayland>(offer);
+		wl_data_offer_add_listener(offer, &data_offer_listener, pending_offer.get());
+	}
+
+	void SetSelectionOffer(wl_data_offer* offer)
+	{
+		if (read_fd >= 0)
+			FinishRead(Rml::String());
+
+		owns_selection = false;
+		current_offer.reset();
+
+		if (!offer)
+			return;
+
+		if (pending_offer && pending_offer->offer == offer)
+			current_offer = std::move(pending_offer);
+		else if (ClipboardOffer_Wayland* offer_data = static_cast<ClipboardOffer_Wayland*>(wl_data_offer_get_user_data(offer)))
+			current_offer.reset(offer_data);
+	}
+
+	static void DataOfferHandleOffer(void* data, wl_data_offer*, const char* mime_type)
+	{
+		auto* offer = static_cast<ClipboardOffer_Wayland*>(data);
+		if (!mime_type)
+			return;
+
+		if (std::strcmp(mime_type, MimeTextUtf8) == 0)
+			offer->has_text_utf8 = true;
+		else if (std::strcmp(mime_type, MimeTextPlain) == 0)
+			offer->has_text_plain = true;
+	}
+
+	static void DataOfferHandleSourceActions(void*, wl_data_offer*, uint32_t) {}
+	static void DataOfferHandleAction(void*, wl_data_offer*, uint32_t) {}
+
+	static void DataDeviceHandleDataOffer(void* data, wl_data_device*, wl_data_offer* offer)
+	{
+		static_cast<ClipboardManager_Wayland*>(data)->SetPendingOffer(offer);
+	}
+
+	static void DataDeviceHandleEnter(void* data, wl_data_device*, uint32_t, wl_surface*, wl_fixed_t, wl_fixed_t, wl_data_offer* offer)
+	{
+		auto* manager = static_cast<ClipboardManager_Wayland*>(data);
+		if (manager->pending_offer && manager->pending_offer->offer == offer)
+			manager->pending_offer.reset();
+		else if (offer)
+			wl_data_offer_destroy(offer);
+	}
+
+	static void DataDeviceHandleLeave(void*, wl_data_device*) {}
+	static void DataDeviceHandleMotion(void*, wl_data_device*, uint32_t, wl_fixed_t, wl_fixed_t) {}
+	static void DataDeviceHandleDrop(void*, wl_data_device*) {}
+
+	static void DataDeviceHandleSelection(void* data, wl_data_device*, wl_data_offer* offer)
+	{
+		static_cast<ClipboardManager_Wayland*>(data)->SetSelectionOffer(offer);
+	}
+
+	static void DataSourceHandleTarget(void*, wl_data_source*, const char*) {}
+
+	static void DataSourceHandleSend(void* data, wl_data_source*, const char* mime_type, int32_t fd)
+	{
+		auto* manager = static_cast<ClipboardManager_Wayland*>(data);
+		if (mime_type && (std::strcmp(mime_type, MimeTextUtf8) == 0 || std::strcmp(mime_type, MimeTextPlain) == 0))
+			WriteAll(fd, manager->owned_text);
+		close(fd);
+	}
+
+	static void DataSourceHandleCancelled(void* data, wl_data_source* source)
+	{
+		auto* manager = static_cast<ClipboardManager_Wayland*>(data);
+		if (manager->active_source == source)
+		{
+			manager->active_source = nullptr;
+			wl_data_source_destroy(source);
+			manager->owns_selection = false;
+		}
+	}
+
+	static void DataSourceHandleDndDropPerformed(void*, wl_data_source*) {}
+	static void DataSourceHandleDndFinished(void*, wl_data_source*) {}
+	static void DataSourceHandleAction(void*, wl_data_source*, uint32_t) {}
+
+	wl_display* display = nullptr;
+	wl_data_device_manager* data_device_manager = nullptr;
+	wl_data_device* data_device = nullptr;
+	wl_data_source* active_source = nullptr;
+	Rml::UniquePtr<ClipboardOffer_Wayland> pending_offer;
+	Rml::UniquePtr<ClipboardOffer_Wayland> current_offer;
+
+	uint32_t selection_serial = 0;
+	bool has_selection_serial = false;
+	bool owns_selection = false;
+	Rml::String owned_text;
+
+	int read_fd = -1;
+	Rml::String read_text;
+	Rml::Function<void(Rml::String)> read_callback;
+
+	static const wl_data_offer_listener data_offer_listener;
+	static const wl_data_device_listener data_device_listener;
+	static const wl_data_source_listener data_source_listener;
+};
+
+const wl_data_offer_listener ClipboardManager_Wayland::data_offer_listener = {
+	ClipboardManager_Wayland::DataOfferHandleOffer,
+	ClipboardManager_Wayland::DataOfferHandleSourceActions,
+	ClipboardManager_Wayland::DataOfferHandleAction,
+};
+
+const wl_data_device_listener ClipboardManager_Wayland::data_device_listener = {
+	ClipboardManager_Wayland::DataDeviceHandleDataOffer,
+	ClipboardManager_Wayland::DataDeviceHandleEnter,
+	ClipboardManager_Wayland::DataDeviceHandleLeave,
+	ClipboardManager_Wayland::DataDeviceHandleMotion,
+	ClipboardManager_Wayland::DataDeviceHandleDrop,
+	ClipboardManager_Wayland::DataDeviceHandleSelection,
+};
+
+const wl_data_source_listener ClipboardManager_Wayland::data_source_listener = {
+	ClipboardManager_Wayland::DataSourceHandleTarget,
+	ClipboardManager_Wayland::DataSourceHandleSend,
+	ClipboardManager_Wayland::DataSourceHandleCancelled,
+	ClipboardManager_Wayland::DataSourceHandleDndDropPerformed,
+	ClipboardManager_Wayland::DataSourceHandleDndFinished,
+	ClipboardManager_Wayland::DataSourceHandleAction,
+};
+
+SystemInterface_Wayland::SystemInterface_Wayland(wl_display* display, wl_shm* shm, wl_data_device_manager* data_device_manager) :
+	display(display), shm(shm), clipboard_manager(Rml::MakeUnique<ClipboardManager_Wayland>(display, data_device_manager))
 {
 	gettimeofday(&start_time, nullptr);
 }
@@ -18,6 +419,11 @@ SystemInterface_Wayland::~SystemInterface_Wayland()
 void SystemInterface_Wayland::SetPointer(wl_pointer* in_pointer)
 {
 	pointer = in_pointer;
+}
+
+void SystemInterface_Wayland::SetSeat(wl_seat* seat)
+{
+	clipboard_manager->SetSeat(seat);
 }
 
 void SystemInterface_Wayland::SetCursorSurface(wl_surface* surface)
@@ -34,6 +440,21 @@ void SystemInterface_Wayland::SetPointerSerial(uint32_t serial)
 void SystemInterface_Wayland::ClearPointerSerial()
 {
 	has_pointer_serial = false;
+}
+
+void SystemInterface_Wayland::SetSeatSerial(uint32_t serial)
+{
+	clipboard_manager->SetSeatSerial(serial);
+}
+
+int SystemInterface_Wayland::GetClipboardReadFd() const
+{
+	return clipboard_manager->GetReadFd();
+}
+
+void SystemInterface_Wayland::ProcessClipboardRead()
+{
+	clipboard_manager->ProcessRead();
 }
 
 double SystemInterface_Wayland::GetElapsedTime()
@@ -101,12 +522,17 @@ void SystemInterface_Wayland::SetMouseCursor(const Rml::String& cursor_name)
 
 void SystemInterface_Wayland::SetClipboardText(const Rml::String& text)
 {
-	clipboard_text = text;
+	clipboard_manager->SetText(text);
+}
+
+void SystemInterface_Wayland::RequestClipboardText(Rml::Function<void(Rml::String)> callback)
+{
+	clipboard_manager->RequestText(std::move(callback));
 }
 
 void SystemInterface_Wayland::GetClipboardText(Rml::String& text)
 {
-	text = clipboard_text;
+	clipboard_manager->GetText(text);
 }
 
 namespace RmlWayland {
