@@ -11,13 +11,29 @@ static constexpr const char* MimeTextUtf8 = "text/plain;charset=utf-8";
 static constexpr const char* MimeTextPlain = "text/plain";
 static constexpr size_t MaxClipboardTextBytes = 16 * 1024 * 1024;
 
-static bool IsTextMimeType(const char* mime_type)
+static int GetTextMimeTypeRank(const char* mime_type)
 {
 	if (!mime_type)
-		return false;
+		return 0;
 
 	const Rml::String mime_type_lower = Rml::StringUtilities::ToLower(mime_type);
-	return mime_type_lower == MimeTextPlain || Rml::StringUtilities::StartsWith(mime_type_lower, "text/plain;");
+	if (mime_type_lower == MimeTextUtf8)
+		return 5;
+	if (mime_type_lower == MimeTextPlain)
+		return 4;
+	if (Rml::StringUtilities::StartsWith(mime_type_lower, "text/plain;"))
+		return 3;
+	if (mime_type_lower == "utf8_string" || mime_type_lower == "text" || mime_type_lower == "string")
+		return 2;
+	if (Rml::StringUtilities::StartsWith(mime_type_lower, "text/"))
+		return 1;
+
+	return 0;
+}
+
+static bool IsTextMimeType(const char* mime_type)
+{
+	return GetTextMimeTypeRank(mime_type) > 0;
 }
 
 static void CloseFd(int& fd)
@@ -77,6 +93,17 @@ struct ClipboardOffer_Wayland {
 
 	wl_data_offer* offer = nullptr;
 	Rml::String text_mime_type;
+	int text_mime_rank = 0;
+
+	void OfferMimeType(const char* mime_type)
+	{
+		const int mime_rank = GetTextMimeTypeRank(mime_type);
+		if (mime_rank > text_mime_rank)
+		{
+			text_mime_type = mime_type;
+			text_mime_rank = mime_rank;
+		}
+	}
 
 	const char* GetPreferredMimeType() const
 	{
@@ -90,8 +117,9 @@ public:
 	~ClipboardManager_Wayland()
 	{
 		CancelRead();
-		current_offer.reset();
-		pending_offer.reset();
+		pending_read_callback = nullptr;
+		current_offer = nullptr;
+		offers.clear();
 		DestroyActiveSource();
 		DestroyDataDevice();
 	}
@@ -147,6 +175,27 @@ public:
 			return;
 		}
 
+		CancelRead();
+		pending_read_callback = nullptr;
+
+		if (!current_offer)
+		{
+			if (callback)
+				callback(Rml::String());
+			return;
+		}
+
+		if (!current_offer->GetPreferredMimeType())
+		{
+			pending_read_callback = std::move(callback);
+			return;
+		}
+
+		StartRead(std::move(callback));
+	}
+
+	void StartRead(Rml::Function<void(Rml::String)> callback)
+	{
 		const char* mime_type = current_offer ? current_offer->GetPreferredMimeType() : nullptr;
 		if (!mime_type)
 		{
@@ -154,8 +203,6 @@ public:
 				callback(Rml::String());
 			return;
 		}
-
-		CancelRead();
 
 		int pipe_fd[2] = {-1, -1};
 		if (pipe(pipe_fd) != 0)
@@ -237,8 +284,9 @@ private:
 	void DestroyDataDevice()
 	{
 		CancelRead();
-		current_offer.reset();
-		pending_offer.reset();
+		pending_read_callback = nullptr;
+		current_offer = nullptr;
+		offers.clear();
 
 		if (data_device)
 		{
@@ -279,37 +327,57 @@ private:
 
 	void SetPendingOffer(wl_data_offer* offer)
 	{
-		pending_offer = Rml::MakeUnique<ClipboardOffer_Wayland>(offer);
-		wl_data_offer_add_listener(offer, &data_offer_listener, pending_offer.get());
+		auto offer_data = Rml::MakeUnique<ClipboardOffer_Wayland>(offer);
+		wl_data_offer_add_listener(offer, &data_offer_listener, this);
+		offers[offer] = std::move(offer_data);
 	}
 
 	void SetSelectionOffer(wl_data_offer* offer)
 	{
 		if (read_fd >= 0)
 			FinishRead(Rml::String());
+		if (pending_read_callback)
+		{
+			Rml::Function<void(Rml::String)> callback = std::move(pending_read_callback);
+			pending_read_callback = nullptr;
+			callback(Rml::String());
+		}
 
-		current_offer.reset();
+		for (auto it = offers.begin(); it != offers.end();)
+		{
+			if (it->first != offer)
+				it = offers.erase(it);
+			else
+				++it;
+		}
+
+		current_offer = nullptr;
 
 		if (!offer)
 			return;
 
-		if (pending_offer && pending_offer->offer == offer)
-			current_offer = std::move(pending_offer);
-		else if (ClipboardOffer_Wayland* offer_data = static_cast<ClipboardOffer_Wayland*>(wl_data_offer_get_user_data(offer)))
-			current_offer.reset(offer_data);
+		auto it = offers.find(offer);
+		if (it != offers.end())
+			current_offer = it->second.get();
 	}
 
-	static void DataOfferHandleOffer(void* data, wl_data_offer*, const char* mime_type)
+	static void DataOfferHandleOffer(void* data, wl_data_offer* offer, const char* mime_type)
 	{
-		auto* offer = static_cast<ClipboardOffer_Wayland*>(data);
-		if (!mime_type)
+		auto* manager = static_cast<ClipboardManager_Wayland*>(data);
+		auto it = manager->offers.find(offer);
+		if (it == manager->offers.end() || !mime_type)
 			return;
 
-		const Rml::String mime_type_lower = Rml::StringUtilities::ToLower(mime_type);
-		if (mime_type_lower == MimeTextUtf8)
-			offer->text_mime_type = mime_type;
-		else if (offer->text_mime_type.empty() && IsTextMimeType(mime_type))
-			offer->text_mime_type = mime_type;
+		ClipboardOffer_Wayland* offer_data = it->second.get();
+		const bool had_text_mime_type = (offer_data->GetPreferredMimeType() != nullptr);
+		offer_data->OfferMimeType(mime_type);
+
+		if (!had_text_mime_type && offer_data == manager->current_offer && manager->pending_read_callback)
+		{
+			Rml::Function<void(Rml::String)> callback = std::move(manager->pending_read_callback);
+			manager->pending_read_callback = nullptr;
+			manager->StartRead(std::move(callback));
+		}
 	}
 
 	static void DataOfferHandleSourceActions(void*, wl_data_offer*, uint32_t) {}
@@ -323,10 +391,7 @@ private:
 	static void DataDeviceHandleEnter(void* data, wl_data_device*, uint32_t, wl_surface*, wl_fixed_t, wl_fixed_t, wl_data_offer* offer)
 	{
 		auto* manager = static_cast<ClipboardManager_Wayland*>(data);
-		if (manager->pending_offer && manager->pending_offer->offer == offer)
-			manager->pending_offer.reset();
-		else if (offer)
-			wl_data_offer_destroy(offer);
+		manager->offers.erase(offer);
 	}
 
 	static void DataDeviceHandleLeave(void*, wl_data_device*) {}
@@ -367,8 +432,8 @@ private:
 	wl_data_device_manager* data_device_manager = nullptr;
 	wl_data_device* data_device = nullptr;
 	wl_data_source* active_source = nullptr;
-	Rml::UniquePtr<ClipboardOffer_Wayland> pending_offer;
-	Rml::UniquePtr<ClipboardOffer_Wayland> current_offer;
+	Rml::UnorderedMap<wl_data_offer*, Rml::UniquePtr<ClipboardOffer_Wayland>> offers;
+	ClipboardOffer_Wayland* current_offer = nullptr;
 
 	uint32_t selection_serial = 0;
 	bool has_selection_serial = false;
@@ -378,6 +443,7 @@ private:
 	int read_fd = -1;
 	Rml::String read_text;
 	Rml::Function<void(Rml::String)> read_callback;
+	Rml::Function<void(Rml::String)> pending_read_callback;
 
 	static const wl_data_offer_listener data_offer_listener;
 	static const wl_data_device_listener data_device_listener;
