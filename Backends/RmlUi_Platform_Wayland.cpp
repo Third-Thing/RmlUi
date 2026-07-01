@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
+#include <signal.h>
 #include <unistd.h>
 
 static constexpr const char* MimeTextUtf8 = "text/plain;charset=utf-8";
@@ -61,6 +62,14 @@ static void SetNonBlocking(int fd)
 
 static void WriteAll(int fd, const Rml::String& text)
 {
+	sigset_t sigpipe_set;
+	sigset_t old_signal_mask;
+	sigset_t pending_signals;
+	sigemptyset(&sigpipe_set);
+	sigaddset(&sigpipe_set, SIGPIPE);
+	const bool had_pending_sigpipe = (sigpending(&pending_signals) == 0 && sigismember(&pending_signals, SIGPIPE) == 1);
+	const bool blocked_sigpipe = (sigprocmask(SIG_BLOCK, &sigpipe_set, &old_signal_mask) == 0);
+
 	const char* data = text.data();
 	size_t remaining = text.size();
 
@@ -80,6 +89,16 @@ static void WriteAll(int fd, const Rml::String& text)
 		{
 			break;
 		}
+	}
+
+	if (blocked_sigpipe)
+	{
+		if (!had_pending_sigpipe)
+		{
+			timespec timeout {};
+			sigtimedwait(&sigpipe_set, nullptr, &timeout);
+		}
+		sigprocmask(SIG_SETMASK, &old_signal_mask, nullptr);
 	}
 }
 
@@ -220,6 +239,7 @@ public:
 		read_callback = std::move(callback);
 		read_text.clear();
 
+		wl_data_offer_accept(current_offer->offer, selection_serial, mime_type);
 		wl_data_offer_receive(current_offer->offer, mime_type, pipe_fd[1]);
 		CloseFd(pipe_fd[1]);
 		wl_display_flush(display);
