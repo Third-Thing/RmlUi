@@ -12,7 +12,7 @@
 static constexpr const char* MimeTextUtf8 = "text/plain;charset=utf-8";
 static constexpr const char* MimeTextPlain = "text/plain";
 static constexpr size_t MaxClipboardTextBytes = 16 * 1024 * 1024;
-static constexpr double ClipboardReadIdleTimeout = 0.05;
+static constexpr double ClipboardReadIdleTimeout = 0.5;
 static constexpr double ClipboardReadTimeout = 5.0;
 
 static double GetMonotonicTime()

@@ -560,7 +560,7 @@ static bool DispatchWaylandEvents(double timeout_seconds)
 		poll_fds[1].fd = clipboard_read_fd;
 		poll_fds[1].events = POLLIN;
 		poll_fd_count = 2;
-		timeout_seconds = Rml::Math::Min(timeout_seconds, 0.05);
+			timeout_seconds = Rml::Math::Min(timeout_seconds, 0.5);
 	}
 	if (const int clipboard_write_fd = data->system_interface->GetClipboardWriteFd(); clipboard_write_fd >= 0)
 	{
