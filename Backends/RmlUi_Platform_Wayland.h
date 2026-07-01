@@ -24,7 +24,9 @@ public:
 	void ClearPointerSerial();
 	void SetSeatSerial(uint32_t serial);
 	int GetClipboardReadFd() const;
+	int GetClipboardWriteFd() const;
 	void ProcessClipboardRead();
+	void ProcessClipboardWrite();
 
 	double GetElapsedTime() override;
 	void SetMouseCursor(const Rml::String& cursor_name) override;

@@ -60,7 +60,7 @@ static void SetNonBlocking(int fd)
 		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void WriteAll(int fd, const Rml::String& text)
+static ssize_t WriteNoSigpipe(int fd, const char* data, size_t size)
 {
 	sigset_t sigpipe_set;
 	sigset_t old_signal_mask;
@@ -70,26 +70,7 @@ static void WriteAll(int fd, const Rml::String& text)
 	const bool had_pending_sigpipe = (sigpending(&pending_signals) == 0 && sigismember(&pending_signals, SIGPIPE) == 1);
 	const bool blocked_sigpipe = (sigprocmask(SIG_BLOCK, &sigpipe_set, &old_signal_mask) == 0);
 
-	const char* data = text.data();
-	size_t remaining = text.size();
-
-	while (remaining > 0)
-	{
-		const ssize_t bytes_written = write(fd, data, remaining);
-		if (bytes_written > 0)
-		{
-			data += bytes_written;
-			remaining -= size_t(bytes_written);
-		}
-		else if (bytes_written < 0 && errno == EINTR)
-		{
-			continue;
-		}
-		else
-		{
-			break;
-		}
-	}
+	const ssize_t bytes_written = write(fd, data, size);
 
 	if (blocked_sigpipe)
 	{
@@ -100,6 +81,8 @@ static void WriteAll(int fd, const Rml::String& text)
 		}
 		sigprocmask(SIG_SETMASK, &old_signal_mask, nullptr);
 	}
+
+	return bytes_written;
 }
 
 struct ClipboardOffer_Wayland {
@@ -136,6 +119,7 @@ public:
 	~ClipboardManager_Wayland()
 	{
 		CancelRead();
+		CancelWrites();
 		pending_read_callback = nullptr;
 		current_offer = nullptr;
 		offers.clear();
@@ -260,6 +244,11 @@ public:
 		return read_fd;
 	}
 
+	int GetWriteFd() const
+	{
+		return pending_writes.empty() ? -1 : pending_writes.front().fd;
+	}
+
 	void ProcessRead()
 	{
 		if (read_fd < 0)
@@ -300,10 +289,48 @@ public:
 		}
 	}
 
+	void ProcessWrite()
+	{
+		while (!pending_writes.empty())
+		{
+			PendingWrite& write = pending_writes.front();
+			while (write.offset < write.text.size())
+			{
+				const ssize_t bytes_written = WriteNoSigpipe(write.fd, write.text.data() + write.offset, write.text.size() - write.offset);
+				if (bytes_written > 0)
+				{
+					write.offset += size_t(bytes_written);
+				}
+				else if (bytes_written < 0 && errno == EINTR)
+				{
+					continue;
+				}
+				else if (bytes_written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+				{
+					return;
+				}
+				else
+				{
+					break;
+				}
+			}
+
+			CloseFd(write.fd);
+			pending_writes.erase(pending_writes.begin());
+		}
+	}
+
 private:
+	struct PendingWrite {
+		int fd = -1;
+		Rml::String text;
+		size_t offset = 0;
+	};
+
 	void DestroyDataDevice()
 	{
 		CancelRead();
+		CancelWrites();
 		pending_read_callback = nullptr;
 		current_offer = nullptr;
 		offers.clear();
@@ -332,6 +359,13 @@ private:
 		CloseFd(read_fd);
 		read_text.clear();
 		read_callback = nullptr;
+	}
+
+	void CancelWrites()
+	{
+		for (PendingWrite& write : pending_writes)
+			CloseFd(write.fd);
+		pending_writes.clear();
 	}
 
 	void FinishRead(Rml::String text)
@@ -429,8 +463,16 @@ private:
 	{
 		auto* manager = static_cast<ClipboardManager_Wayland*>(data);
 		if (IsTextMimeType(mime_type))
-			WriteAll(fd, manager->owned_text);
-		close(fd);
+		{
+			SetCloseOnExec(fd);
+			SetNonBlocking(fd);
+			manager->pending_writes.push_back(PendingWrite{fd, manager->owned_text, 0});
+			manager->ProcessWrite();
+		}
+		else
+		{
+			close(fd);
+		}
 	}
 
 	static void DataSourceHandleCancelled(void* data, wl_data_source* source)
@@ -464,6 +506,7 @@ private:
 	Rml::String read_text;
 	Rml::Function<void(Rml::String)> read_callback;
 	Rml::Function<void(Rml::String)> pending_read_callback;
+	Rml::Vector<PendingWrite> pending_writes;
 
 	static const wl_data_offer_listener data_offer_listener;
 	static const wl_data_device_listener data_device_listener;
@@ -542,9 +585,19 @@ int SystemInterface_Wayland::GetClipboardReadFd() const
 	return clipboard_manager->GetReadFd();
 }
 
+int SystemInterface_Wayland::GetClipboardWriteFd() const
+{
+	return clipboard_manager->GetWriteFd();
+}
+
 void SystemInterface_Wayland::ProcessClipboardRead()
 {
 	clipboard_manager->ProcessRead();
+}
+
+void SystemInterface_Wayland::ProcessClipboardWrite()
+{
+	clipboard_manager->ProcessWrite();
 }
 
 double SystemInterface_Wayland::GetElapsedTime()

@@ -553,13 +553,19 @@ static bool DispatchWaylandEvents(double timeout_seconds)
 	display_fd.fd = wl_display_get_fd(display);
 	display_fd.events = POLLIN;
 
-	pollfd poll_fds[2] = {display_fd, {}};
+	pollfd poll_fds[3] = {display_fd, {}, {}};
 	int poll_fd_count = 1;
 	if (const int clipboard_read_fd = data->system_interface->GetClipboardReadFd(); clipboard_read_fd >= 0)
 	{
 		poll_fds[1].fd = clipboard_read_fd;
 		poll_fds[1].events = POLLIN;
 		poll_fd_count = 2;
+	}
+	if (const int clipboard_write_fd = data->system_interface->GetClipboardWriteFd(); clipboard_write_fd >= 0)
+	{
+		poll_fds[poll_fd_count].fd = clipboard_write_fd;
+		poll_fds[poll_fd_count].events = POLLOUT;
+		poll_fd_count += 1;
 	}
 
 	const int timeout_ms = int(std::ceil(timeout_seconds * 1000.0));
@@ -576,8 +582,16 @@ static bool DispatchWaylandEvents(double timeout_seconds)
 
 	while (wl_display_dispatch_pending(display) > 0) {}
 
-	if (poll_result > 0 && poll_fd_count > 1 && (poll_fds[1].revents & (POLLIN | POLLHUP | POLLERR)))
-		data->system_interface->ProcessClipboardRead();
+	if (poll_result > 0)
+	{
+		for (int i = 1; i < poll_fd_count; i++)
+		{
+			if ((poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) && poll_fds[i].events == POLLIN)
+				data->system_interface->ProcessClipboardRead();
+			if ((poll_fds[i].revents & (POLLOUT | POLLHUP | POLLERR)) && poll_fds[i].events == POLLOUT)
+				data->system_interface->ProcessClipboardWrite();
+		}
+	}
 
 	return wl_display_get_error(display) == 0;
 }
