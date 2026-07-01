@@ -70,7 +70,15 @@ static bool GetUtf16EndianFromMimeType(const Rml::String& mime_type, bool& big_e
 	return false;
 }
 
-static bool GetUtf16EndianFromData(const Rml::String& text, bool& big_endian)
+static bool IsUtf8MimeType(const Rml::String& mime_type)
+{
+	const Rml::String mime_type_lower = Rml::StringUtilities::ToLower(mime_type);
+	return mime_type_lower == MimeTextUtf8 || mime_type_lower == "utf8_string" ||
+		mime_type_lower.find("charset=utf-8") != Rml::String::npos ||
+		mime_type_lower.find("charset=utf8") != Rml::String::npos;
+}
+
+static bool GetUtf16EndianFromBom(const Rml::String& text, bool& big_endian)
 {
 	const auto byte_at = [&text](size_t index) { return static_cast<unsigned char>(text[index]); };
 	if (text.size() >= 2)
@@ -86,6 +94,14 @@ static bool GetUtf16EndianFromData(const Rml::String& text, bool& big_endian)
 			return true;
 		}
 	}
+
+	return false;
+}
+
+static bool GetUtf16EndianFromData(const Rml::String& text, bool& big_endian)
+{
+	if (GetUtf16EndianFromBom(text, big_endian))
+		return true;
 
 	const size_t sample_size = (text.size() < size_t(128) ? text.size() : size_t(128));
 	size_t even_zero_count = 0;
@@ -184,12 +200,21 @@ static Rml::String DecodeClipboardText(Rml::String text, const Rml::String& mime
 {
 	bool big_endian = false;
 	const bool has_utf16_mime_type = GetUtf16EndianFromMimeType(mime_type, big_endian);
+	if (has_utf16_mime_type)
+	{
+		GetUtf16EndianFromBom(text, big_endian);
+		return ConvertUtf16ToUtf8(text, big_endian);
+	}
+
 	bool data_big_endian = false;
-	const bool looks_like_utf16 = GetUtf16EndianFromData(text, data_big_endian);
+	if (GetUtf16EndianFromBom(text, data_big_endian))
+		return ConvertUtf16ToUtf8(text, data_big_endian);
+
+	const bool looks_like_utf16 = !IsUtf8MimeType(mime_type) && GetUtf16EndianFromData(text, data_big_endian);
 	if (looks_like_utf16)
 		big_endian = data_big_endian;
 
-	if (has_utf16_mime_type || looks_like_utf16)
+	if (looks_like_utf16)
 		return ConvertUtf16ToUtf8(text, big_endian);
 
 	return text;
