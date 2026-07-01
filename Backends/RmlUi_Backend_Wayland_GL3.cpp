@@ -534,7 +534,7 @@ static bool InitializeEGL()
 	if (!eglMakeCurrent(data->egl_display, data->egl_surface, data->egl_surface, data->egl_context))
 		return false;
 
-	eglSwapInterval(data->egl_display, 1);
+	eglSwapInterval(data->egl_display, 0);
 	return true;
 }
 
