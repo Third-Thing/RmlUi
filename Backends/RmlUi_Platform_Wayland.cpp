@@ -47,6 +47,153 @@ static bool IsTextMimeType(const char* mime_type)
 	return GetTextMimeTypeRank(mime_type) > 0;
 }
 
+static bool GetUtf16EndianFromMimeType(const Rml::String& mime_type, bool& big_endian)
+{
+	const Rml::String mime_type_lower = Rml::StringUtilities::ToLower(mime_type);
+	if (mime_type_lower.find("utf-16be") != Rml::String::npos || mime_type_lower.find("utf16be") != Rml::String::npos)
+	{
+		big_endian = true;
+		return true;
+	}
+	if (mime_type_lower.find("utf-16le") != Rml::String::npos || mime_type_lower.find("utf16le") != Rml::String::npos)
+	{
+		big_endian = false;
+		return true;
+	}
+	if (mime_type_lower.find("utf-16") != Rml::String::npos || mime_type_lower.find("utf16") != Rml::String::npos)
+	{
+		big_endian = false;
+		return true;
+	}
+
+	return false;
+}
+
+static bool GetUtf16EndianFromData(const Rml::String& text, bool& big_endian)
+{
+	const auto byte_at = [&text](size_t index) { return static_cast<unsigned char>(text[index]); };
+	if (text.size() >= 2)
+	{
+		if (byte_at(0) == 0xfe && byte_at(1) == 0xff)
+		{
+			big_endian = true;
+			return true;
+		}
+		if (byte_at(0) == 0xff && byte_at(1) == 0xfe)
+		{
+			big_endian = false;
+			return true;
+		}
+	}
+
+	const size_t sample_size = (text.size() < size_t(128) ? text.size() : size_t(128));
+	size_t even_zero_count = 0;
+	size_t odd_zero_count = 0;
+	for (size_t i = 0; i < sample_size; ++i)
+	{
+		if (text[i] == '\0')
+		{
+			if (i % 2 == 0)
+				++even_zero_count;
+			else
+				++odd_zero_count;
+		}
+	}
+
+	const size_t pairs = sample_size / 2;
+	if (pairs >= 4 && odd_zero_count >= pairs / 2 && even_zero_count <= pairs / 8)
+	{
+		big_endian = false;
+		return true;
+	}
+	if (pairs >= 4 && even_zero_count >= pairs / 2 && odd_zero_count <= pairs / 8)
+	{
+		big_endian = true;
+		return true;
+	}
+
+	return false;
+}
+
+static void AppendUtf8(Rml::String& output, uint32_t codepoint)
+{
+	if (codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff))
+		codepoint = uint32_t(Rml::Character::Replacement);
+
+	output += Rml::StringUtilities::ToUTF8(static_cast<Rml::Character>(codepoint));
+}
+
+static Rml::String ConvertUtf16ToUtf8(const Rml::String& text, bool big_endian)
+{
+	const auto read_u16 = [&text, big_endian](size_t index) {
+		const uint16_t first = static_cast<unsigned char>(text[index]);
+		const uint16_t second = (index + 1 < text.size() ? static_cast<unsigned char>(text[index + 1]) : 0);
+		return uint16_t(big_endian ? (first << 8) | second : (second << 8) | first);
+	};
+
+	Rml::String output;
+	output.reserve(text.size());
+
+	size_t index = 0;
+	if (text.size() >= 2)
+	{
+		const uint16_t bom = read_u16(0);
+		if (bom == 0xfeff || bom == 0xfffe)
+			index = 2;
+	}
+
+	while (index < text.size())
+	{
+		const uint16_t code_unit = read_u16(index);
+		index += 2;
+		if (code_unit == 0 && index >= text.size())
+			break;
+
+		if (code_unit >= 0xd800 && code_unit <= 0xdbff)
+		{
+			if (index < text.size())
+			{
+				const uint16_t next_code_unit = read_u16(index);
+				if (next_code_unit >= 0xdc00 && next_code_unit <= 0xdfff)
+				{
+					index += 2;
+					const uint32_t high = uint32_t(code_unit - 0xd800);
+					const uint32_t low = uint32_t(next_code_unit - 0xdc00);
+					AppendUtf8(output, 0x10000 + ((high << 10) | low));
+					continue;
+				}
+			}
+
+			AppendUtf8(output, uint32_t(Rml::Character::Replacement));
+		}
+		else if (code_unit >= 0xdc00 && code_unit <= 0xdfff)
+		{
+			AppendUtf8(output, uint32_t(Rml::Character::Replacement));
+		}
+		else
+		{
+			AppendUtf8(output, code_unit);
+		}
+	}
+
+	return output;
+}
+
+static Rml::String DecodeClipboardText(Rml::String text, const Rml::String& mime_type)
+{
+	bool big_endian = false;
+	const bool has_utf16_mime_type = GetUtf16EndianFromMimeType(mime_type, big_endian);
+	bool data_big_endian = false;
+	const bool looks_like_utf16 = GetUtf16EndianFromData(text, data_big_endian);
+	if (looks_like_utf16)
+		big_endian = data_big_endian;
+
+	if (has_utf16_mime_type || looks_like_utf16)
+		return ConvertUtf16ToUtf8(text, big_endian);
+
+	return text;
+}
+
 static void CloseFd(int& fd)
 {
 	if (fd >= 0)
@@ -231,6 +378,7 @@ public:
 
 		read_fd = pipe_fd[0];
 		read_callback = std::move(callback);
+		read_mime_type = mime_type;
 		read_text.clear();
 		read_start_time = GetMonotonicTime();
 		read_last_data_time = 0.0;
@@ -381,6 +529,7 @@ private:
 	void CancelRead()
 	{
 		CloseFd(read_fd);
+		read_mime_type.clear();
 		read_text.clear();
 		read_callback = nullptr;
 		read_start_time = 0.0;
@@ -397,6 +546,8 @@ private:
 	void FinishRead(Rml::String text)
 	{
 		CloseFd(read_fd);
+		text = DecodeClipboardText(std::move(text), read_mime_type);
+		read_mime_type.clear();
 		read_text.clear();
 		read_start_time = 0.0;
 		read_last_data_time = 0.0;
@@ -531,6 +682,7 @@ private:
 	Rml::String owned_text;
 
 	int read_fd = -1;
+	Rml::String read_mime_type;
 	Rml::String read_text;
 	Rml::Function<void(Rml::String)> read_callback;
 	Rml::Function<void(Rml::String)> pending_read_callback;
