@@ -11,6 +11,15 @@ static constexpr const char* MimeTextUtf8 = "text/plain;charset=utf-8";
 static constexpr const char* MimeTextPlain = "text/plain";
 static constexpr size_t MaxClipboardTextBytes = 16 * 1024 * 1024;
 
+static bool IsTextMimeType(const char* mime_type)
+{
+	if (!mime_type)
+		return false;
+
+	const Rml::String mime_type_lower = Rml::StringUtilities::ToLower(mime_type);
+	return mime_type_lower == MimeTextPlain || Rml::StringUtilities::StartsWith(mime_type_lower, "text/plain;");
+}
+
 static void CloseFd(int& fd)
 {
 	if (fd >= 0)
@@ -67,16 +76,11 @@ struct ClipboardOffer_Wayland {
 	}
 
 	wl_data_offer* offer = nullptr;
-	bool has_text_utf8 = false;
-	bool has_text_plain = false;
+	Rml::String text_mime_type;
 
 	const char* GetPreferredMimeType() const
 	{
-		if (has_text_utf8)
-			return MimeTextUtf8;
-		if (has_text_plain)
-			return MimeTextPlain;
-		return nullptr;
+		return text_mime_type.empty() ? nullptr : text_mime_type.c_str();
 	}
 };
 
@@ -284,7 +288,6 @@ private:
 		if (read_fd >= 0)
 			FinishRead(Rml::String());
 
-		owns_selection = false;
 		current_offer.reset();
 
 		if (!offer)
@@ -302,10 +305,11 @@ private:
 		if (!mime_type)
 			return;
 
-		if (std::strcmp(mime_type, MimeTextUtf8) == 0)
-			offer->has_text_utf8 = true;
-		else if (std::strcmp(mime_type, MimeTextPlain) == 0)
-			offer->has_text_plain = true;
+		const Rml::String mime_type_lower = Rml::StringUtilities::ToLower(mime_type);
+		if (mime_type_lower == MimeTextUtf8)
+			offer->text_mime_type = mime_type;
+		else if (offer->text_mime_type.empty() && IsTextMimeType(mime_type))
+			offer->text_mime_type = mime_type;
 	}
 
 	static void DataOfferHandleSourceActions(void*, wl_data_offer*, uint32_t) {}
@@ -339,7 +343,7 @@ private:
 	static void DataSourceHandleSend(void* data, wl_data_source*, const char* mime_type, int32_t fd)
 	{
 		auto* manager = static_cast<ClipboardManager_Wayland*>(data);
-		if (mime_type && (std::strcmp(mime_type, MimeTextUtf8) == 0 || std::strcmp(mime_type, MimeTextPlain) == 0))
+		if (IsTextMimeType(mime_type))
 			WriteAll(fd, manager->owned_text);
 		close(fd);
 	}
