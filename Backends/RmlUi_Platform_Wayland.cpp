@@ -6,11 +6,21 @@
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 static constexpr const char* MimeTextUtf8 = "text/plain;charset=utf-8";
 static constexpr const char* MimeTextPlain = "text/plain";
 static constexpr size_t MaxClipboardTextBytes = 16 * 1024 * 1024;
+static constexpr double ClipboardReadIdleTimeout = 0.05;
+static constexpr double ClipboardReadTimeout = 5.0;
+
+static double GetMonotonicTime()
+{
+	timespec now {};
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return double(now.tv_sec) + double(now.tv_nsec) / 1000000000.0;
+}
 
 static int GetTextMimeTypeRank(const char* mime_type)
 {
@@ -222,6 +232,8 @@ public:
 		read_fd = pipe_fd[0];
 		read_callback = std::move(callback);
 		read_text.clear();
+		read_start_time = GetMonotonicTime();
+		read_last_data_time = 0.0;
 
 		wl_data_offer_accept(current_offer->offer, selection_serial, mime_type);
 		wl_data_offer_receive(current_offer->offer, mime_type, pipe_fd[1]);
@@ -267,6 +279,7 @@ public:
 				}
 
 				read_text.append(buffer, size_t(bytes_read));
+				read_last_data_time = GetMonotonicTime();
 			}
 			else if (bytes_read == 0)
 			{
@@ -279,6 +292,17 @@ public:
 			}
 			else if (errno == EAGAIN || errno == EWOULDBLOCK)
 			{
+				const double now = GetMonotonicTime();
+				if (!read_text.empty() && now - read_last_data_time >= ClipboardReadIdleTimeout)
+				{
+					FinishRead(std::move(read_text));
+					return;
+				}
+				if (read_text.empty() && now - read_start_time >= ClipboardReadTimeout)
+				{
+					FinishRead(Rml::String());
+					return;
+				}
 				return;
 			}
 			else
@@ -359,6 +383,8 @@ private:
 		CloseFd(read_fd);
 		read_text.clear();
 		read_callback = nullptr;
+		read_start_time = 0.0;
+		read_last_data_time = 0.0;
 	}
 
 	void CancelWrites()
@@ -372,6 +398,8 @@ private:
 	{
 		CloseFd(read_fd);
 		read_text.clear();
+		read_start_time = 0.0;
+		read_last_data_time = 0.0;
 
 		Rml::Function<void(Rml::String)> callback = std::move(read_callback);
 		read_callback = nullptr;
@@ -506,6 +534,8 @@ private:
 	Rml::String read_text;
 	Rml::Function<void(Rml::String)> read_callback;
 	Rml::Function<void(Rml::String)> pending_read_callback;
+	double read_start_time = 0.0;
+	double read_last_data_time = 0.0;
 	Rml::Vector<PendingWrite> pending_writes;
 
 	static const wl_data_offer_listener data_offer_listener;
