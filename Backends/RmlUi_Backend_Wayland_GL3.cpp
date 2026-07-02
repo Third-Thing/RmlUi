@@ -20,6 +20,9 @@
 static constexpr int MinimumWindowWidth = 1;
 static constexpr int MinimumWindowHeight = 1;
 static constexpr double ClipboardPollTimeout = 0.5;
+// Safety timeout while waiting for a frame callback. In practice the callback (or input) wakes us far sooner; this only
+// bounds the wait if the compositor withholds callbacks (e.g. while occluded), so we keep servicing the event loop.
+static constexpr double FramePacingTimeout = 0.1;
 using Clock = std::chrono::steady_clock;
 
 struct KeyboardRepeatState {
@@ -54,6 +57,7 @@ struct BackendData {
 	wl_egl_window* egl_window = nullptr;
 	wl_pointer* pointer = nullptr;
 	wl_keyboard* keyboard = nullptr;
+	wl_callback* frame_callback = nullptr;
 
 	EGLDisplay egl_display = EGL_NO_DISPLAY;
 	EGLConfig egl_config = nullptr;
@@ -68,9 +72,24 @@ struct BackendData {
 	bool configured = false;
 	bool running = true;
 	bool context_dimensions_dirty = true;
+	// Presentation is decoupled from event dispatch. frame_ready (driven by the frame callback) tells us the compositor
+	// is ready for a new frame; while it is false we skip the swap rather than block, so the event loop keeps running
+	// (and clipboard sends keep flowing) even when occluded. needs_redraw gates whether we present at all: when nothing
+	// has changed we skip the swap so the loop can idle in poll instead of being re-woken by buffer-release events.
+	bool frame_ready = true;
+	bool needs_redraw = true;
 };
 
 static Rml::UniquePtr<BackendData> data;
+
+// Marks the next frame as worth presenting; call from any handler that changes what is displayed. Application code that
+// mutates the document outside of input (e.g. a running progress bar) must request a redraw through RmlUi in the usual
+// way, by calling Context::RequestNextUpdate(0) while the change is ongoing (the demo sample does this).
+static void RequestRedraw()
+{
+	if (data)
+		data->needs_redraw = true;
+}
 
 static void UpdateWindowSize(int width, int height)
 {
@@ -86,6 +105,7 @@ static void UpdateWindowSize(int width, int height)
 		data->render_interface->SetViewport(data->width, data->height);
 
 	data->context_dimensions_dirty = true;
+	RequestRedraw();
 }
 
 static void RegistryHandleGlobal(void* user_data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version)
@@ -128,6 +148,7 @@ static void XdgSurfaceHandleConfigure(void*, xdg_surface* xdg_surface, uint32_t 
 {
 	xdg_surface_ack_configure(xdg_surface, serial);
 	data->configured = true;
+	RequestRedraw();
 }
 
 static const xdg_surface_listener xdg_surface_listener = {
@@ -163,6 +184,7 @@ static const zxdg_toplevel_decoration_v1_listener xdg_toplevel_decoration_listen
 
 static void PointerHandleEnter(void*, wl_pointer*, uint32_t serial, wl_surface*, wl_fixed_t sx, wl_fixed_t sy)
 {
+	RequestRedraw();
 	data->system_interface->SetPointerSerial(serial);
 	if (data->context)
 		data->context->ProcessMouseMove(wl_fixed_to_int(sx), wl_fixed_to_int(sy), data->keyboard_state.modifiers);
@@ -171,6 +193,7 @@ static void PointerHandleEnter(void*, wl_pointer*, uint32_t serial, wl_surface*,
 
 static void PointerHandleLeave(void*, wl_pointer*, uint32_t, wl_surface*)
 {
+	RequestRedraw();
 	data->system_interface->ClearPointerSerial();
 	if (data->context)
 		data->context->ProcessMouseLeave();
@@ -178,6 +201,7 @@ static void PointerHandleLeave(void*, wl_pointer*, uint32_t, wl_surface*)
 
 static void PointerHandleMotion(void*, wl_pointer*, uint32_t, wl_fixed_t sx, wl_fixed_t sy)
 {
+	RequestRedraw();
 	if (data->context)
 		data->context->ProcessMouseMove(wl_fixed_to_int(sx), wl_fixed_to_int(sy), data->keyboard_state.modifiers);
 }
@@ -191,6 +215,7 @@ static void PointerHandleButton(void*, wl_pointer*, uint32_t serial, uint32_t, u
 	if (mouse_button < 0)
 		return;
 
+	RequestRedraw();
 	data->system_interface->SetSeatSerial(serial);
 
 	if (state == WL_POINTER_BUTTON_STATE_PRESSED)
@@ -201,6 +226,7 @@ static void PointerHandleButton(void*, wl_pointer*, uint32_t serial, uint32_t, u
 
 static void PointerHandleAxis(void*, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value)
 {
+	RequestRedraw();
 	if (data->context && axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
 		data->context->ProcessMouseWheel(float(wl_fixed_to_double(value)) / 10.f, data->keyboard_state.modifiers);
 }
@@ -251,6 +277,7 @@ static void KeyboardHandleEnter(void*, wl_keyboard*, uint32_t serial, wl_surface
 
 static void KeyboardHandleLeave(void*, wl_keyboard*, uint32_t, wl_surface*)
 {
+	RequestRedraw();
 	data->repeat_state.Stop();
 	data->keyboard_state.Reset();
 }
@@ -264,6 +291,8 @@ static void SubmitKeyDown(xkb_keycode_t keycode)
 {
 	if (!data->context || !data->keyboard_state.state)
 		return;
+
+	RequestRedraw();
 
 	const xkb_keysym_t sym = xkb_state_key_get_one_sym(data->keyboard_state.state, keycode);
 	const Rml::Input::KeyIdentifier rml_key = RmlWayland::ConvertKeySym(sym);
@@ -342,6 +371,7 @@ static void KeyboardHandleKey(void*, wl_keyboard*, uint32_t serial, uint32_t, ui
 	if (!data->context || !data->keyboard_state.state)
 		return;
 
+	RequestRedraw();
 	data->system_interface->SetSeatSerial(serial);
 
 	const xkb_keycode_t keycode = key + 8;
@@ -366,6 +396,7 @@ static void KeyboardHandleKey(void*, wl_keyboard*, uint32_t serial, uint32_t, ui
 
 static void KeyboardHandleModifiers(void*, wl_keyboard*, uint32_t, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)
 {
+	RequestRedraw();
 	data->keyboard_state.UpdateModifiers(depressed, latched, locked, group);
 }
 
@@ -534,12 +565,16 @@ static bool InitializeEGL()
 	if (!eglMakeCurrent(data->egl_display, data->egl_surface, data->egl_surface, data->egl_context))
 		return false;
 
-	eglSwapInterval(data->egl_display, 1);
+	// Present without blocking: eglSwapBuffers under an interval >= 1 would park the main thread until the next frame
+	// throttle, stalling Wayland event dispatch (and thus clipboard sends) whenever the compositor withholds frames,
+	// e.g. while occluded. Frame pacing is instead driven by wl_surface_frame callbacks in PresentFrame.
+	eglSwapInterval(data->egl_display, 0);
 	return true;
 }
 
-static bool DispatchWaylandEvents(double timeout_seconds)
+static bool DispatchWaylandEvents(double timeout_seconds, bool& timed_out)
 {
+	timed_out = false;
 	wl_display* display = data->display;
 
 	while (wl_display_prepare_read(display) != 0)
@@ -573,6 +608,7 @@ static bool DispatchWaylandEvents(double timeout_seconds)
 
 	const int timeout_ms = int(std::ceil(timeout_seconds * 1000.0));
 	const int poll_result = poll(poll_fds, poll_fd_count, timeout_ms);
+	timed_out = (poll_result == 0);
 	if (poll_result > 0 && (poll_fds[0].revents & POLLIN))
 	{
 		if (wl_display_read_events(display) < 0)
@@ -640,6 +676,8 @@ void Backend::Shutdown()
 		eglTerminate(data->egl_display);
 	}
 
+	if (data->frame_callback)
+		wl_callback_destroy(data->frame_callback);
 	if (data->egl_window)
 		wl_egl_window_destroy(data->egl_window);
 	if (data->keyboard)
@@ -702,10 +740,36 @@ bool Backend::ProcessEvents(Rml::Context* context, KeyDownCallback key_down_call
 	data->context = context;
 	data->key_down_callback = key_down_callback;
 
-	double timeout_seconds = power_save ? Rml::Math::Min(context->GetNextUpdateDelay(), 10.0) : 0.0;
+	// Redraw continuously when an animation is scheduled (RmlUi requests an immediate update, i.e. a delay of zero) or
+	// the caller opted out of power saving; the frame pacing below throttles that to the display rate. Otherwise we only
+	// redraw in response to an explicit request (input, resize, or a scheduled update coming due below).
+	const double next_update_delay = context->GetNextUpdateDelay();
+	if (!power_save || next_update_delay <= 0.0)
+		data->needs_redraw = true;
+
+	// Choose how long to block:
+	// - Something to draw and the compositor is ready: return immediately to render and present.
+	// - Something to draw but awaiting the frame callback: pace to the compositor; the callback (or input) wakes us.
+	// - Nothing to draw: idle until the next scheduled update or input arrives (the else branch implies power_save,
+	//   since !power_save forces needs_redraw above). The cap bounds how long an out-of-contract application change can
+	//   go unseen, matching the platform-independent sample loop behaviour.
+	double timeout_seconds;
+	if (data->needs_redraw && data->frame_ready)
+		timeout_seconds = 0.0;
+	else if (data->needs_redraw)
+		timeout_seconds = FramePacingTimeout;
+	else
+		timeout_seconds = Rml::Math::Min(next_update_delay, 10.0);
 	timeout_seconds = GetKeyRepeatTimeout(timeout_seconds);
-	if (!DispatchWaylandEvents(timeout_seconds))
+
+	bool timed_out = false;
+	if (!DispatchWaylandEvents(timeout_seconds, timed_out))
 		data->running = false;
+
+	// An expired wait means a scheduled update came due or we hit the idle cap; redraw so animations advance and any
+	// application-driven change is picked up even if the application did not request an update.
+	if (timed_out)
+		data->needs_redraw = true;
 
 	ProcessKeyRepeats();
 
@@ -721,6 +785,20 @@ void Backend::RequestExit()
 	data->running = false;
 }
 
+static void SurfaceFrameHandleDone(void*, wl_callback* callback, uint32_t)
+{
+	wl_callback_destroy(callback);
+	if (data && data->frame_callback == callback)
+	{
+		data->frame_callback = nullptr;
+		data->frame_ready = true;
+	}
+}
+
+static const wl_callback_listener surface_frame_listener = {
+	SurfaceFrameHandleDone,
+};
+
 void Backend::BeginFrame()
 {
 	RMLUI_ASSERT(data && data->render_interface);
@@ -732,5 +810,24 @@ void Backend::PresentFrame()
 {
 	RMLUI_ASSERT(data && data->render_interface);
 	data->render_interface->EndFrame();
+
+	// Present only when the compositor is ready for a new frame (frame_ready; false e.g. while occluded) and something
+	// has actually changed (needs_redraw). Skipping the swap when idle is what lets the loop block in poll: otherwise
+	// the non-blocking swap would be issued every iteration and the buffer release events it generates would keep waking
+	// poll, spinning the loop at full speed.
+	if (!data->frame_ready || !data->needs_redraw)
+		return;
+
+	// Ask to be notified when the compositor wants the next frame, and clear frame_ready until it does. The request is
+	// committed together with the buffer by eglSwapBuffers, so it throttles continuous redrawing to the refresh rate of
+	// the output the surface is on.
+	if (wl_callback* callback = wl_surface_frame(data->surface))
+	{
+		data->frame_callback = callback;
+		wl_callback_add_listener(callback, &surface_frame_listener, nullptr);
+		data->frame_ready = false;
+	}
+
+	data->needs_redraw = false;
 	eglSwapBuffers(data->egl_display, data->egl_surface);
 }
